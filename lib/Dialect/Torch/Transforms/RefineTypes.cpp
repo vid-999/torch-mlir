@@ -115,8 +115,10 @@ static torch_upstream::TypeKind getTypeKind(Type type) {
 /// types.
 static Optional<Type> meetElementTypes(Type lhs, Type rhs) {
   auto isNullOrBuiltIn = [](Type type) { return !type || isBuiltInType(type); };
-  assert(isNullOrBuiltIn(lhs) && "`lhs` must be a builtin type");
-  assert(isNullOrBuiltIn(rhs) && "`rhs` must be a builtin type");
+  if (!isNullOrBuiltIn(lhs))
+    llvm_unreachable("`lhs` must be a builtin type");
+  if (!isNullOrBuiltIn(rhs))
+    llvm_unreachable("`rhs` must be a builtin type");
 
   if (!lhs)
     return rhs;
@@ -173,8 +175,9 @@ struct ValueKnowledge {
 
   void setScalarType(Type type) {
     bool isValidScalarType = type.isa<NumberType, IntType, Torch::FloatType>();
-    assert(isValidScalarType &&
-           "scalarType can only be one of NumberType, IntType and FloatType");
+    if (!isValidScalarType)
+      llvm_unreachable(
+          "scalarType can only be one of NumberType, IntType and FloatType");
     scalarType = type;
     kind = getTypeKind(type);
   }
