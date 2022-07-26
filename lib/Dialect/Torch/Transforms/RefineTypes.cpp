@@ -1036,6 +1036,40 @@ void TypeAnalysis::visitOperation(Operation *op,
     return;
   }
 
+  // case for Embedding bag padding idx.
+  if (auto embedding_bag_padding_idx =
+          dyn_cast<AtenEmbeddingBagPaddingIdxOp>(op)) {
+    // result 0
+    auto result0Knowledge =
+        ValueKnowledge::getTensorPessimisticValueState(op->getContext());
+    result0Knowledge.dtype = Float32Type::get(op->getContext());
+    // result 1
+    auto result1Knowledge =
+        ValueKnowledge::getTensorPessimisticValueState(op->getContext());
+    result1Knowledge.dtype =
+        IntegerType::get(op->getContext(), 64, IntegerType::Signed);
+    // result 2
+    auto result2Knowledge =
+        ValueKnowledge::getTensorPessimisticValueState(op->getContext());
+    result2Knowledge.dtype =
+        IntegerType::get(op->getContext(), 64, IntegerType::Signed);
+    // result 3
+    auto result3Knowledge =
+        ValueKnowledge::getTensorPessimisticValueState(op->getContext());
+    result3Knowledge.dtype =
+        IntegerType::get(op->getContext(), 64, IntegerType::Signed);
+
+    incorporateKnowledge(embedding_bag_padding_idx.getResult(0),
+                                        result0Knowledge);
+    incorporateKnowledge(embedding_bag_padding_idx.getResult(1),
+                                    result1Knowledge);
+    incorporateKnowledge(embedding_bag_padding_idx.getResult(2),
+                                    result2Knowledge);
+    incorporateKnowledge(embedding_bag_padding_idx.getResult(3),
+                                    result3Knowledge);
+    return;
+  }
+
   if (auto softmaxIntOp = dyn_cast<AtenSoftmaxIntOp>(op)) {
     visitAtenSoftmaxLikeOp(softmaxIntOp, operands);
     return;

@@ -36,7 +36,7 @@ static bool isViewLikeOp(Operation *op) {
              AtenExpandOp, AtenFlattenUsingIntsOp, AtenPermuteOp, AtenReshapeOp,
              Aten_ReshapeAliasOp, AtenSelectIntOp, AtenSliceTensorOp,
              AtenSqueezeDimOp, AtenSqueezeOp, AtenTOp, AtenToDtypeOp,
-             AtenTransposeIntOp, AtenUnsqueezeOp, AtenViewOp,
+             AtenTransposeIntOp, AtenUnsqueezeOp,AtenToDeviceOp, AtenViewOp,
              TensorStaticInfoCastOp, AtenToDtypeLayoutOp, AtenNumpyTOp>(op);
 }
 

@@ -352,6 +352,267 @@ public:
 };
 } // namespace
 
+
+namespace {
+// AtenEmbeddingPaddingIdxOp
+// SUM mode == integer 0
+// Sums bags of embeddings together from a weight tensor based on an index and
+// offset Vector. Example arguments weight = [[1, 3, 5, 3],
+//           [3, 4, 2, 1],
+//           [2, 2, 3, 2],
+//           [0, 4, 2, 1]]
+//
+// indices = [0, 2, 3, 1, 2, 3, 2, 1, 0, 1]
+// offsets = [0, 3, 5]
+//
+// output_tensor = initZeroTensor(offsets_length, embedding_size)
+//
+// for i in range(offsets_length):         <- dim0
+//     for j in range(indices_length):     <- dim1
+//         for k in range(embedding_size): <- dim2
+//             if(offsets[i] <= j and j < offsets[i+1]):
+//                 output_tensor[i][k] = output_tensor[i][k] +
+//                 weight[indices[j]][k]
+//             else:
+//                 break
+//
+// Indexing maps for linalg::Generic ops
+//
+//
+// indices_indexing_map  = (d0, d1, d2) -> (d1)
+// offset_indexing_map   = (d0, d1, d2) -> (d0)
+// output_indexing_map   = (d0, d1, d2) -> (d0, d2)
+//
+
+class ConvertAtenEmbeddingBagPaddingIdxOp
+    : public OpConversionPattern<AtenEmbeddingBagPaddingIdxOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenEmbeddingBagPaddingIdxOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+    Location loc = op->getLoc();
+    auto context = op->getContext();
+    Value weight = adaptor.weight();
+    Value indices = adaptor.indices();
+    Value offsets = adaptor.offsets();
+    Value scale_grad_by_freq = adaptor.scale_grad_by_freq();
+    Value mode = op.mode();
+    Value sparse = op.sparse();
+    Value include_last_offset = adaptor.include_last_offset();
+
+    int64_t modeInt;
+    // TODO: handle mean and max modes
+    // sum mode
+    if (!matchPattern(mode, m_TorchConstantInt(&modeInt))) {
+      return rewriter.notifyMatchFailure(
+          op, "mode is expected to be a constant integer value.");
+    }
+
+    bool isSparse;
+    // TODO: handle sparse mode, only handling dense mode rn.
+    if (!matchPattern(sparse, m_TorchConstantBool(&isSparse))) {
+      return rewriter.notifyMatchFailure(
+        op, "sparse is expected to be a constant boolean value."
+     );
+   }
+
+    // get the Embedding dimension
+    Value embeddingDim = getDimOp(rewriter, loc, weight, 1);
+
+    auto weightTy = weight.getType().cast<RankedTensorType>();
+    if (weightTy.getRank() != 2)
+      return rewriter.notifyMatchFailure(op, "weight must be rank 2");
+
+    auto indicesTy = indices.getType().cast<RankedTensorType>();
+    if (indicesTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(op, "indices must be a vector");
+
+    auto offsetsTy = offsets.getType().cast<RankedTensorType>();
+    if (offsetsTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(op, "offsets much be a vector");
+
+    Type weightElemTy = weightTy.getElementType();
+
+    if(!isSparse){
+      if (modeInt == 0) {
+
+        int64_t iterationMapDimension = weightTy.getRank() + indicesTy.getRank();
+
+        SmallVector<AffineExpr> indicesExpr;
+        indicesExpr.push_back(mlir::getAffineDimExpr(1, context));
+
+        auto indicesIndexingMap =
+            AffineMap::get(/*dimCount=*/iterationMapDimension, /*symbolCount=*/0,
+                          indicesExpr, context);
+
+        SmallVector<AffineExpr> offsetsExpr;
+       offsetsExpr.push_back(mlir::getAffineDimExpr(0, context));
+
+        auto offsetIndexingMap =
+            AffineMap::get(/*dimCount=*/iterationMapDimension, /*symbolCount=*/0,
+                          offsetsExpr, context);
+
+        SmallVector<AffineExpr> outputExpr;
+        outputExpr.push_back(mlir::getAffineDimExpr(0, context));
+        outputExpr.push_back(mlir::getAffineDimExpr(2, context));
+
+        auto outputIndexingMap =
+            AffineMap::get(/*dimCount=*/iterationMapDimension, /*symbolCount=*/0,
+                          outputExpr, context);
+
+        SmallVector<AffineMap, 3> indexingMaps = {
+            indicesIndexingMap,
+           offsetIndexingMap,
+           outputIndexingMap,
+       };
+
+        SmallVector<StringRef> iteratorTypes(iterationMapDimension,
+                                            getParallelIteratorTypeName());
+
+        SmallVector<Value> sizes{getDimOp(rewriter, loc, offsets, 0),
+                                embeddingDim};
+
+       Value initTensor =
+          createZeroInitTensor(rewriter, loc, sizes, weightElemTy);
+       Value offsetsLength = getDimOp(rewriter, loc, offsets, 0);
+       Value indicesLength = getDimOp(rewriter, loc, indices, 0);
+
+        Value embeddingBagResult =
+            rewriter
+                .create<linalg::GenericOp>(
+                    loc, initTensor.getType(), ValueRange{indices, offsets},
+                    initTensor,
+                    /*indexingMaps=*/indexingMaps,
+                    /*iteratorTypes=*/iteratorTypes,
+                    [&](OpBuilder &b, Location loc, ValueRange args) {
+                      Value indexInIndices = args[0];
+                      Value offsetsI = args[1];
+                      Value initTensorElem = args[2];
+
+                      Value indexI =
+                          rewriter.create<linalg::IndexOp>(loc, /*value=*/0);
+                      Value indexIToInt = castIndexToInt64(rewriter, loc, indexI);
+                      Value one = getConstant(
+                          rewriter, loc, 1,
+                          mlir::IntegerType::get(getContext(), 64,
+                                                IntegerType::Signless));
+                      Value offsetIndexPlusOneInt =
+                          rewriter.create<arith::AddIOp>(loc, indexIToInt, one);
+
+                      Value offsetIndexPlusOne =
+                          castIntToIndex(rewriter, loc, offsetIndexPlusOneInt);
+                      Value checkLast = rewriter.create<arith::CmpIOp>(
+                          loc, arith::CmpIPredicate::eq,
+                          castIndexToInt64(rewriter, loc, offsetsLength),
+                          offsetIndexPlusOneInt);
+                      Value nextOffset = rewriter.create<arith::SelectOp>(
+                          loc, checkLast,
+                          castIndexToInt64(rewriter, loc, indicesLength),
+                          rewriter.create<tensor::ExtractOp>(loc, offsets,
+                                                            offsetIndexPlusOne));
+
+                      Value indicesIndex = castIndexToInt64(
+                          rewriter, loc,
+                          rewriter.create<linalg::IndexOp>(loc, /*value=*/1));
+
+                      Value offsetLessThanIndicesIndex =
+                          rewriter.create<arith::CmpIOp>(
+                              loc, arith::CmpIPredicate::slt, offsetsI,
+                              indicesIndex);
+                      Value offsetEqualToIndicesIndex =
+                          rewriter.create<arith::CmpIOp>(loc,
+                                                        arith::CmpIPredicate::eq,
+                                                        offsetsI, indicesIndex);
+                      Value offsetLessThanOrEqualToIndicesIndex =
+                          rewriter.create<arith::OrIOp>(
+                              loc, offsetLessThanIndicesIndex,
+                              offsetEqualToIndicesIndex);
+
+                      Value indicesIndexLessThanNextOffset =
+                          rewriter.create<arith::CmpIOp>(
+                              loc, arith::CmpIPredicate::slt, indicesIndex,
+                              nextOffset);
+
+                      Value indicesIndexWithinBounds =
+                          rewriter.create<arith::AndIOp>(
+                              loc, offsetLessThanOrEqualToIndicesIndex,
+                              indicesIndexLessThanNextOffset);
+
+                     SmallVector<Value> index_into_weight;
+                     index_into_weight.push_back(
+                          castIntToIndex(rewriter, loc, indexInIndices));
+                      index_into_weight.push_back(
+                          rewriter.create<linalg::IndexOp>(loc, /*value=*/2));
+                      Value weightElem = rewriter.create<tensor::ExtractOp>(
+                          loc, weight, index_into_weight);
+
+                      Value addResult = rewriter.create<arith::AddFOp>(
+                          loc, weightElem, initTensorElem);
+                      Value select = rewriter.create<arith::SelectOp>(
+                          loc, indicesIndexWithinBounds, addResult,
+                          initTensorElem);
+                      rewriter.create<linalg::YieldOp>(loc, select);
+                    })
+                .getResult(0);
+
+        // cast outputType.
+       auto resultType1 = typeConverter->convertType(op->getResult(0).getType());
+       Value initTensor_new =
+           rewriter.create<tensor::CastOp>(loc, resultType1, embeddingBagResult);
+
+        // offset2 tensor, this should be an empty tensor for the sum mode
+        SmallVector<Value> offset2size;
+        Type offsetElemTy = offsetsTy.getElementType();
+        Value zeroDim = rewriter.create<arith::ConstantIndexOp>(loc, /*value=*/0);
+        offset2size.push_back(zeroDim);
+        Value offset2 =
+           rewriter.create<linalg::InitTensorOp>(loc, offset2size, offsetElemTy);
+      auto resultType2 = typeConverter->convertType(op->getResult(1).getType());
+       Value offset2_new =
+           rewriter.create<tensor::CastOp>(loc, resultType2, offset2);
+
+        SmallVector<Value> offset_size = getTensorSizes(rewriter, loc, offsets);
+        // bagsize, vector of size offset with zeros, I think this is always just
+        // a vector of zeros in the sum mode
+        Value bagsize =
+            createZeroInitTensor(rewriter, loc, offset_size, offsetElemTy);
+        auto resultType3 = typeConverter->convertType(op->getResult(2).getType());
+        Value bagsize_new =
+            rewriter.create<tensor::CastOp>(loc, resultType3, bagsize);
+
+        // max indices, vector of size offset with zeros, this is also always a
+       // vector of zeros in the sum mode. Its mainly used in the max mode.
+       Value indicesout =
+           createZeroInitTensor(rewriter, loc, offset_size, offsetElemTy);
+       auto resultType4 = typeConverter->convertType(op->getResult(3).getType());
+       Value indicesout_new =
+           rewriter.create<tensor::CastOp>(loc, resultType4, indicesout);
+
+        rewriter.replaceOp(
+            op, {initTensor_new, offset2_new, bagsize_new, indicesout_new});
+
+        return success();
+      }
+      else if (modeInt == 1){
+        return op.emitError("Unimplemented: Mean mode is not supported yet for EmbeddingBag.");
+      }
+      else if (modeInt == 2){
+        return op.emitError("Unimplemented: Max mode is not supported yet for EmbeddingBag.");
+      }
+     else{
+        return op.emitError("Unimplemented: Unknown mode encountered for EmbeddingBag.");
+      }
+    }
+    else{
+      return op.emitError("Unimplemented: Sparse mode is not supported yet for EmbeddingBag.");
+    }
+  }
+};
+} // namespace
+
 void mlir::torch::torch_to_linalg::
     populateIndirectDataMovementPatternsAndLegality(
         TypeConverter &typeConverter, RewritePatternSet &patterns,
@@ -365,4 +626,6 @@ void mlir::torch::torch_to_linalg::
   patterns.add<ConvertAtenIndexSelectOp>(typeConverter, context);
   target.addIllegalOp<AtenIndexTensorOp>();
   patterns.add<ConvertAtenIndexTensorOp>(typeConverter, context);
+  target.addIllegalOp<AtenEmbeddingBagPaddingIdxOp>();
+  patterns.add<ConvertAtenEmbeddingBagPaddingIdxOp>(typeConverter, context);
 }

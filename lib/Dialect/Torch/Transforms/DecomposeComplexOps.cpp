@@ -2220,6 +2220,25 @@ public:
 };
 } // namespace
 
+
+namespace {
+// Decompose `aten.to.device` op into `aten.to.dtype` op.
+class DecomposeAtenToDeviceOp : public OpRewritePattern<AtenToDeviceOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenToDeviceOp op,
+                                PatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<AtenToDtypeOp>(op, op.getType(), op.self(),
+                                               op.dtype(), op.non_blocking(),
+                                               op.copy(), op.memory_format());
+
+    return success();
+  }
+};
+} // namespace
+
+
 namespace {
 // Decompose the `aten.select_scatter` operation into `aten.slice_scatter` op.
 class DecomposeAtenSelectScatterOp
@@ -2426,6 +2445,8 @@ class DecomposeComplexOpsPass
     target.addIllegalOp<AtenSelectScatterOp>();
     patterns.add<DecomposeAtenVarDimOp>(context);
     target.addIllegalOp<AtenVarDimOp>();
+    patterns.add<DecomposeAtenToDeviceOp>(context);
+    target.addIllegalOp<AtenToDeviceOp>();
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns)))) {
