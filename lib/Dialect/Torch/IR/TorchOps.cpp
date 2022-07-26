@@ -1509,6 +1509,35 @@ OpFoldResult AtenEqIntListOp::fold(ArrayRef<Attribute> operands) {
 }
 
 //===----------------------------------------------------------------------===//
+// AtenAddTOp
+//===----------------------------------------------------------------------===//
+
+void AtenAddTOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                             MLIRContext *context) {
+  patterns.add(+[](AtenAddTOp op, PatternRewriter &rewriter) {
+    auto lhsListConstruct = op.a().getDefiningOp<Torch::PrimListConstructOp>();
+    if (!lhsListConstruct || isListPotentiallyMutated(lhsListConstruct))
+      return failure();
+
+    auto rhsListConstruct = op.b().getDefiningOp<Torch::PrimListConstructOp>();
+    if (!rhsListConstruct || isListPotentiallyMutated(rhsListConstruct))
+      return failure();
+
+    SmallVector<Value> concatenatedList;
+    for (auto a : lhsListConstruct.getOperands()) {
+      concatenatedList.push_back(a);
+    }
+    for (auto b : rhsListConstruct.getOperands()) {
+      concatenatedList.push_back(b);
+    }
+
+    rewriter.replaceOpWithNewOp<Torch::PrimListConstructOp>(op, op.getType(),
+                                                            concatenatedList);
+    return success();
+  });
+}
+
+//===----------------------------------------------------------------------===//
 // PrimTupleIndexOp
 //===----------------------------------------------------------------------===//
 

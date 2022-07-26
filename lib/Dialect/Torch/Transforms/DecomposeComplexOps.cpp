@@ -2289,6 +2289,57 @@ public:
 } // namespace
 
 namespace {
+// Decompose `aten.linear` op into `aten.matmul` and `aten.add` ops.
+class DecomposeAtenLinearOp : public OpRewritePattern<AtenLinearOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenLinearOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = op.input();
+    Value weight = op.weight();
+    Value bias = op.bias();
+
+    BaseTensorType inputType = input.getType().cast<BaseTensorType>();
+    if (!inputType.hasSizes() || inputType.getSizes().size() < 2)
+      return rewriter.notifyMatchFailure(
+          op, "expected input to be rank 2 or greater");
+
+    BaseTensorType weightType = weight.getType().cast<BaseTensorType>();
+    // weight must be a rank 2 matrix.
+    if (!weightType.hasSizes() || weightType.getSizes().size() != 2)
+      return rewriter.notifyMatchFailure(op, "expected weight to be a rank 2");
+
+    ArrayRef<int64_t> wShape = weightType.getSizes();
+    SmallVector<int64_t> transposeShape;
+    transposeShape.push_back(wShape[1]);
+    transposeShape.push_back(wShape[0]);
+    Type transposeType = weightType.getWithSizesAndDtype(
+        llvm::makeArrayRef(transposeShape), weightType.getDtype());
+    Value transposeWeight =
+        rewriter.create<AtenTOp>(loc, transposeType, weight);
+
+    Value matmul = rewriter.create<AtenMatmulOp>(loc, op.getType(), input,
+                                                 transposeWeight);
+    if (bias.getType().isa<Torch::NoneType>()) {
+      rewriter.replaceOp(op, matmul);
+      return success();
+    }
+
+    BaseTensorType biasType = bias.getType().cast<BaseTensorType>();
+    if (!biasType.hasSizes() || biasType.getSizes().size() != 1)
+      return rewriter.notifyMatchFailure(op, "expected bias to be rank 1");
+
+    Value alpha =
+        rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(1));
+    rewriter.replaceOpWithNewOp<AtenAddTensorOp>(op, op.getType(), matmul,
+                                                 op.bias(), alpha);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
 class DecomposeComplexOpsPass
     : public DecomposeComplexOpsBase<DecomposeComplexOpsPass> {
   void runOnOperation() override {
@@ -2360,6 +2411,8 @@ class DecomposeComplexOpsPass
     target.addIllegalOp<AtenLayerNormOp>();
     patterns.add<DecomposeAtenLayerNormOp>(context);
     target.addIllegalOp<AtenNativeBatchNormOp>();
+    patterns.add<DecomposeAtenLinearOp>(context);
+    target.addIllegalOp<AtenLinearOp>();
     patterns.add<DecomposeAtenNativeBatchNormOp>(context);
     target.addIllegalOp<AtenConvolutionOverrideableOp>();
     patterns.add<DecomposeAtenConvolutionOverrideableOp>(context);
